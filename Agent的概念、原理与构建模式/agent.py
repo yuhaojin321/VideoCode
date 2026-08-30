@@ -1,5 +1,5 @@
-import ast
 import inspect
+import json
 import os
 import re
 from string import Template
@@ -19,7 +19,7 @@ class ReActAgent:
         self.model = model
         self.project_directory = project_directory
         self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
+            base_url="https://api.deepseek.com",
             api_key=ReActAgent.get_api_key(),
         )
 
@@ -43,16 +43,20 @@ class ReActAgent:
             # 检测模型是否输出 Final Answer，如果是的话，直接返回
             if "<final_answer>" in content:
                 final_answer = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
-                return final_answer.group(1)
+                if final_answer:
+                    return final_answer.group(1).strip()
+                # 模型输出缺少闭合标签（常因被 max_tokens 截断）：取 <final_answer> 之后的内容
+                return content.split("<final_answer>", 1)[1].strip()
 
             # 检测 Action
             action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
             if not action_match:
+                print(f"\n\n⚠️ 模型本轮原始输出：\n{content}")
                 raise RuntimeError("模型未输出 <action>")
             action = action_match.group(1)
-            tool_name, args = self.parse_action(action)
+            tool_name, kwargs = self.parse_action(action)
 
-            print(f"\n\n🔧 Action: {tool_name}({', '.join(args)})")
+            print(f"\n\n🔧 Action: {tool_name}({kwargs})")
             # 只有终端命令才需要询问用户，其他的工具直接执行
             should_continue = input(f"\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
             if should_continue.lower() != 'y':
@@ -60,7 +64,7 @@ class ReActAgent:
                 return "操作被用户取消"
 
             try:
-                observation = self.tools[tool_name](*args)
+                observation = self.tools[tool_name](**kwargs)
             except Exception as e:
                 observation = f"工具执行错误：{str(e)}"
             print(f"\n\n🔍 Observation：{observation}")
@@ -95,9 +99,9 @@ class ReActAgent:
     def get_api_key() -> str:
         """Load the API key from an environment variable."""
         load_dotenv()
-        api_key = os.getenv("OPENROUTER_API_KEY")
+        api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
-            raise ValueError("未找到 OPENROUTER_API_KEY 环境变量，请在 .env 文件中设置。")
+            raise ValueError("未找到 DEEPSEEK_API_KEY 环境变量，请在 .env 文件中设置。")
         return api_key
 
     def call_model(self, messages):
@@ -105,82 +109,27 @@ class ReActAgent:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
+            max_tokens=8192,
         )
         content = response.choices[0].message.content
         messages.append({"role": "assistant", "content": content})
         return content
 
-    def parse_action(self, code_str: str) -> Tuple[str, List[str]]:
-        match = re.match(r'(\w+)\((.*)\)', code_str, re.DOTALL)
-        if not match:
-            raise ValueError("Invalid function call syntax")
+    def parse_action(self, action_str: str) -> Tuple[str, dict]:
+        """将 <action> 内的 JSON 解析为 (工具名, 参数字典)。
 
-        func_name = match.group(1)
-        args_str = match.group(2).strip()
-
-        # 手动解析参数，特别处理包含多行内容的字符串
-        args = []
-        current_arg = ""
-        in_string = False
-        string_char = None
-        i = 0
-        paren_depth = 0
-        
-        while i < len(args_str):
-            char = args_str[i]
-            
-            if not in_string:
-                if char in ['"', "'"]:
-                    in_string = True
-                    string_char = char
-                    current_arg += char
-                elif char == '(':
-                    paren_depth += 1
-                    current_arg += char
-                elif char == ')':
-                    paren_depth -= 1
-                    current_arg += char
-                elif char == ',' and paren_depth == 0:
-                    # 遇到顶层逗号，结束当前参数
-                    args.append(self._parse_single_arg(current_arg.strip()))
-                    current_arg = ""
-                else:
-                    current_arg += char
-            else:
-                current_arg += char
-                if char == string_char and (i == 0 or args_str[i-1] != '\\'):
-                    in_string = False
-                    string_char = None
-            
-            i += 1
-        
-        # 添加最后一个参数
-        if current_arg.strip():
-            args.append(self._parse_single_arg(current_arg.strip()))
-        
-        return func_name, args
-    
-    def _parse_single_arg(self, arg_str: str):
-        """解析单个参数"""
-        arg_str = arg_str.strip()
-        
-        # 如果是字符串字面量
-        if (arg_str.startswith('"') and arg_str.endswith('"')) or \
-           (arg_str.startswith("'") and arg_str.endswith("'")):
-            # 移除外层引号并处理转义字符
-            inner_str = arg_str[1:-1]
-            # 处理常见的转义字符
-            inner_str = inner_str.replace('\\"', '"').replace("\\'", "'")
-            inner_str = inner_str.replace('\\n', '\n').replace('\\t', '\t')
-            inner_str = inner_str.replace('\\r', '\r').replace('\\\\', '\\')
-            return inner_str
-        
-        # 尝试使用 ast.literal_eval 解析其他类型
+        <action> 的内容形如：
+            {"tool": "write_to_file", "args": {"file_path": "...", "content": "..."}}
+        使用标准 JSON 解析器，能正确处理多行文本、引号、逗号等特殊字符。
+        """
+        action_str = action_str.strip()
+        # 去掉模型可能多包裹的 Markdown 代码块标记（如 ```json ... ```）
+        action_str = re.sub(r"^```(?:json)?\s*|\s*```$", "", action_str, flags=re.DOTALL).strip()
         try:
-            return ast.literal_eval(arg_str)
-        except (SyntaxError, ValueError):
-            # 如果解析失败，返回原始字符串
-            return arg_str
+            data = json.loads(action_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"<action> 中的 JSON 解析失败：{e}\n原始内容：\n{action_str}")
+        return data["tool"], data["args"]
 
     def get_operating_system_name(self):
         os_map = {
@@ -209,6 +158,30 @@ def run_terminal_command(command):
     run_result = subprocess.run(command, shell=True, capture_output=True, text=True)
     return "执行成功" if run_result.returncode == 0 else run_result.stderr
 
+
+def fix_input_encoding(s: str) -> str:
+    """修复终端输入编码问题。
+
+    当终端以非 UTF-8 编码（如 Windows 中文系统的 GBK）发送中文时，Python 的
+    input() 会把这些字节按 utf-8 + surrogateescape 误读成「代理字符」
+    （U+DC80~U+DCFF），后续 JSON 序列化时报 "surrogates not allowed"。
+    这里把误读的原始字节还原，再用常见编码重新解码出正确文本。
+    """
+    if not any(0xD800 <= ord(c) <= 0xDFFF for c in s):
+        return s
+    try:
+        raw = s.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        # 无法还原原始字节时，退化为替换非法字符
+        return s.encode("utf-8", "replace").decode("utf-8")
+    for enc in ("gb18030", "gbk", "big5", "utf-8"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 @click.command()
 @click.argument('project_directory',
                 type=click.Path(exists=True, file_okay=False, dir_okay=True))
@@ -216,9 +189,9 @@ def main(project_directory):
     project_dir = os.path.abspath(project_directory)
 
     tools = [read_file, write_to_file, run_terminal_command]
-    agent = ReActAgent(tools=tools, model="openai/gpt-4o", project_directory=project_dir)
+    agent = ReActAgent(tools=tools, model="deepseek-chat", project_directory=project_dir)
 
-    task = input("请输入任务：")
+    task = fix_input_encoding(input("请输入任务："))
 
     final_answer = agent.run(task)
 
